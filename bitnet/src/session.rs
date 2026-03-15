@@ -288,6 +288,12 @@ fn build_sampler(strategy: &SamplingStrategy) -> Result<*mut sys::llama_sampler,
             unsafe { sys::llama_sampler_chain_add(chain, stage) };
         }
         SamplingStrategy::TopP { temperature, top_p, seed } => {
+            // Repetition penalty prevents the model from looping on the same
+            // token or phrase, which is common without it on completion prompts.
+            let penalty_stage = unsafe {
+                sys::llama_sampler_init_penalties(64, 1.1, 0.0, 0.0)
+            };
+            unsafe { sys::llama_sampler_chain_add(chain, penalty_stage) };
             // Sampler stage order matches the chain used by run_inference.py:
             // top-k -> top-p -> min-p -> temperature -> distribution draw.
             let top_k_stage = unsafe { sys::llama_sampler_init_top_k(40) };

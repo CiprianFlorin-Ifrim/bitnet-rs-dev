@@ -206,6 +206,12 @@ unsafe extern "C" {
     pub fn llama_sampler_init_top_k(k: i32) -> *mut llama_sampler;
     pub fn llama_sampler_init_min_p(p: c_float, min_keep: usize) -> *mut llama_sampler;
     pub fn llama_sampler_init_dist(seed: u32) -> *mut llama_sampler;
+    pub fn llama_sampler_init_penalties(
+        penalty_last_n: i32,
+        penalty_repeat: c_float,
+        penalty_freq: c_float,
+        penalty_present: c_float,
+    ) -> *mut llama_sampler;
 
     pub fn llama_sampler_sample(
         smpl: *mut llama_sampler,
