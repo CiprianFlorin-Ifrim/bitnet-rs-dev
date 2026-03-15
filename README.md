@@ -73,7 +73,7 @@ cd ../..
 
 ---
 
-## Step 2 — Download and convert the model
+## Step 2 - Download and convert the model
 
 The pre-packaged GGUF on Hugging Face is missing pre-tokenizer metadata and
 produces incoherent output. You must convert from the BF16 master weights.
