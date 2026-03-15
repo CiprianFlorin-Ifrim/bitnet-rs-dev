@@ -1,6 +1,6 @@
 //! Safe Rust bindings to Microsoft's BitNet b1.58 inference engine.
 //!
-//! # Usage
+//! # Single-turn usage
 //!
 //! ```no_run
 //! use bitnet::{init, suppress_warnings, Model, ModelParams, ContextParams, GenerateParams};
@@ -12,18 +12,47 @@
 //!     "models/bitnet-b1.58-2B-4T-bf16/ggml-model-i2s-bitnet.gguf",
 //!     ModelParams::default(),
 //! )?;
-//!
 //! let mut session = model.session(ContextParams::default())?;
-//!
-//! // Full response as a String.
 //! let response = session.generate("The capital of France is", &GenerateParams::default())?;
 //! println!("{response}");
+//! # Ok::<(), bitnet::Error>(())
+//! ```
 //!
-//! // Streaming — callback is invoked for each token piece as it is produced.
-//! session.generate_streaming("The capital of France is", &GenerateParams::default(), |piece| {
-//!     print!("{piece}");
-//! })?;
+//! # Multi-turn chat
 //!
+//! Sessions track the KV cache position across turns. Only new tokens are
+//! encoded on each turn — history is never re-encoded.
+//!
+//! ```no_run
+//! use bitnet::{init, suppress_warnings, Model, ModelParams, ContextParams, GenerateParams};
+//!
+//! init();
+//! suppress_warnings();
+//!
+//! let model = Model::load(
+//!     "models/bitnet-b1.58-2B-4T-bf16/ggml-model-i2s-bitnet.gguf",
+//!     ModelParams::default(),
+//! )?;
+//! let mut session = model.session(ContextParams::default())?;
+//!
+//! // Turn 1 — BOS added automatically because kv_pos is 0
+//! session.generate_streaming(
+//!     "<|start_header_id|>system<|end_header_id|>\nYou are helpful.<|eot_id|>\
+//!      <|start_header_id|>user<|end_header_id|>\nHello!<|eot_id|>\
+//!      <|start_header_id|>assistant<|end_header_id|>\n",
+//!     &GenerateParams::default(),
+//!     |piece| print!("{piece}"),
+//! )?;
+//! session.encode("<|eot_id|>")?;
+//!
+//! // Turn 2 — only new tokens, no re-encoding of history
+//! session.generate_streaming(
+//!     "<|start_header_id|>user<|end_header_id|>\nHow are you?<|eot_id|>\
+//!      <|start_header_id|>assistant<|end_header_id|>\n",
+//!     &GenerateParams::default(),
+//!     |piece| print!("{piece}"),
+//! )?;
+//! session.encode("<|eot_id|>")?;
 //! # Ok::<(), bitnet::Error>(())
 //! ```
 //!
@@ -41,14 +70,8 @@
 //! # CPU only
 //!
 //! BitNet uses lookup-table kernels for its ternary weight format that only
-//! run on the CPU. Offloading layers to a GPU backend produces incorrect output
-//! and is not supported by this crate.
-//!
-//! # Chat template
-//!
-//! This model uses the Llama 3 chat template. When building conversational
-//! prompts, structure them using the header tokens the model was trained with.
-//! See the inference example for a full implementation.
+//! run on the CPU. GPU offloading produces incorrect output and is not
+//! supported by this crate.
 
 mod error;
 mod model;
@@ -61,34 +84,37 @@ pub use params::{ContextParams, GenerateParams, ModelParams, SamplingStrategy};
 pub use session::Session;
 
 /// Initialises the ggml backend. Must be called once before the first
-/// Model::load call. Safe to call from main or behind a std::sync::Once guard.
+/// Model::load call.
 pub fn init() {
     unsafe { bitnet_sys::llama_backend_init() };
 }
 
-/// Releases resources allocated by init. In most applications the OS will
-/// handle this on exit, but calling it explicitly is good practice in
-/// long-running processes that load and unload models at runtime.
+/// Releases resources allocated by init. Optional at process exit.
 pub fn deinit() {
     unsafe { bitnet_sys::llama_backend_free() };
 }
 
-/// Suppresses warning-level output from the underlying library, including
-/// the pre-tokenizer and control token warnings, while keeping informational
-/// messages such as memory usage and context size visible.
+/// Suppresses warning-level output from the underlying library while keeping
+/// informational messages such as memory usage and context size.
 pub fn suppress_warnings() {
     unsafe extern "C" fn filter_log(
-        level: std::ffi::c_int,
+        _level: std::ffi::c_int,
         text: *const std::ffi::c_char,
         _user_data: *mut std::ffi::c_void,
     ) {
-        // llama.cpp log levels: 1=debug, 2=info, 3=warn, 4=error.
-        // Info and errors are kept. Warnings (tokenizer noise) and debug output are suppressed.
-        if level == 1 {
-            let s = unsafe { std::ffi::CStr::from_ptr(text) };
-            if let Ok(s) = s.to_str() {
-                eprint!("{s}");
+        let s = unsafe { std::ffi::CStr::from_ptr(text) };
+        if let Ok(s) = s.to_str() {
+            if s.contains("pre-tokenizer")
+                || s.contains("GENERATION QUALITY")
+                || s.contains("CONSIDER REGENERATING")
+                || s.contains("****")
+                || s.contains("is not marked as EOG")
+                || s.contains("special_eos_id is not in special_eog_ids")
+                || s.contains("control token:")
+            {
+                return;
             }
+            eprint!("{s}");
         }
     }
     unsafe { bitnet_sys::llama_log_set(Some(filter_log), std::ptr::null_mut()) };

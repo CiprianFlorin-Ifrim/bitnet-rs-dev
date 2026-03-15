@@ -1,11 +1,12 @@
-// Interactive chat example for BitNet b1.58.
+// Multi-turn interactive chat example for BitNet b1.58.
 //
-// Maintains a conversation history and formats each turn using the Llama 3
-// chat template that this model was trained with.
+// Uses incremental KV cache encoding — only new tokens are processed on each
+// turn, history is never re-encoded. This eliminates the prefill delay on
+// subsequent turns.
 //
 // Usage:
-//   cargo run --release --example inference -- <path-to-gguf>
-//   cargo run --release --example inference -- <path-to-gguf> "optional system prompt"
+//   cargo run --release --example inference_chat_multiturn -- <path-to-gguf>
+//   cargo run --release --example inference_chat_multiturn -- <path-to-gguf> "system prompt"
 
 use std::env;
 use std::io::{self, BufRead, Write};
@@ -17,17 +18,20 @@ fn main() -> Result<(), bitnet::Error> {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
-        eprintln!("Usage: inference <path-to-gguf> [system-prompt]");
+        eprintln!("Usage: inference_chat_multiturn <path-to-gguf> [system-prompt]");
         eprintln!();
         eprintln!("Example:");
-        eprintln!("  cargo run --release --example inference -- \\");
+        eprintln!("  cargo run --release --example inference_chat_multiturn -- \\");
         eprintln!("    models/bitnet-b1.58-2B-4T-bf16/ggml-model-i2s-bitnet.gguf \\");
         eprintln!("    \"You are a helpful assistant.\"");
         std::process::exit(1);
     }
 
     let model_path = &args[1];
-    let system_prompt = args.get(2).map(|s| s.as_str()).unwrap_or("You are a helpful assistant.");
+    let system_prompt = args
+        .get(2)
+        .map(|s| s.as_str())
+        .unwrap_or("You are a helpful assistant.");
 
     bitnet::init();
     bitnet::suppress_warnings();
@@ -48,16 +52,9 @@ fn main() -> Result<(), bitnet::Error> {
         },
     };
 
-    // Conversation history stored as alternating user/assistant turn strings.
-    // The full history is re-encoded on every turn so the model has context.
-    let mut history: Vec<(String, String)> = Vec::new();
-
+    let mut session = model.session(ContextParams::default())?;
     let stdin = io::stdin();
-    let mut session = model.session(ContextParams {
-        n_ctx: 0,
-        n_batch: 32,
-        n_threads: 10,
-    })?;
+    let mut first_turn = true;
 
     loop {
         print!("You: ");
@@ -72,68 +69,57 @@ fn main() -> Result<(), bitnet::Error> {
         if user_input.is_empty() {
             continue;
         }
-        if user_input.eq_ignore_ascii_case("quit") || user_input.eq_ignore_ascii_case("exit") {
+        if user_input.eq_ignore_ascii_case("quit")
+            || user_input.eq_ignore_ascii_case("exit")
+        {
             break;
         }
 
-        // Build the full prompt from history plus the new user turn using the
-        // Llama 3 chat template this model was trained with.
-        let prompt = build_prompt(system_prompt, &history, &user_input);
+        // On the first turn include the system prompt. On subsequent turns
+        // only the new user message is sent — the session already has the
+        // full history in its KV cache.
+        let prompt = if first_turn {
+            format!(
+                "<|start_header_id|>system<|end_header_id|>\n{system_prompt}<|eot_id|>\
+                 <|start_header_id|>user<|end_header_id|>\n{user_input}<|eot_id|>\
+                 <|start_header_id|>assistant<|end_header_id|>\n"
+            )
+        } else {
+            format!(
+                "<|start_header_id|>user<|end_header_id|>\n{user_input}<|eot_id|>\
+                 <|start_header_id|>assistant<|end_header_id|>\n"
+            )
+        };
 
         print!("Assistant: ");
         let _ = io::stdout().flush();
 
-        let mut assistant_response = String::new();
-        let gen_start = Instant::now();
         let mut token_count = 0usize;
+        let mut ttft: Option<f32> = None;
+        let gen_start = Instant::now();
 
         session.generate_streaming(&prompt, &params, |piece| {
+            if ttft.is_none() {
+                ttft = Some(gen_start.elapsed().as_secs_f32());
+            }
             print!("{piece}");
             let _ = io::stdout().flush();
-            assistant_response.push_str(piece);
             token_count += 1;
         })?;
 
-        let elapsed = gen_start.elapsed().as_secs_f32();
-        println!("\n[{token_count} tokens, {elapsed:.2}s, {:.1} tok/s]\n",
-            token_count as f32 / elapsed);
+        // Encode the closing token so the KV cache reflects the complete turn.
+        session.encode("<|eot_id|>")?;
 
-        // Store the completed turn so the next prompt includes it as context.
-        history.push((user_input, assistant_response));
+        let elapsed = gen_start.elapsed().as_secs_f32();
+        println!(
+            "\n[{token_count} tokens, ttft: {:.2}s, total: {elapsed:.2}s, {:.1} tok/s]\n",
+            ttft.unwrap_or(0.0),
+            token_count as f32 / elapsed
+        );
+
+        first_turn = false;
     }
 
     bitnet::deinit();
     Ok(())
-}
-
-/// Formats the full conversation as a Llama 3 chat template prompt.
-///
-/// The model was trained with this specific structure. Deviating from it
-/// produces incoherent output because the model expects these control tokens
-/// to understand turn boundaries.
-fn build_prompt(system: &str, history: &[(String, String)], user_input: &str) -> String {
-    let mut prompt = String::new();
-
-    // System turn
-    prompt.push_str("<|start_header_id|>system<|end_header_id|>\n");
-    prompt.push_str(system);
-    prompt.push_str("<|eot_id|>");
-
-    // Previous conversation turns
-    for (user, assistant) in history {
-        prompt.push_str("<|start_header_id|>user<|end_header_id|>\n");
-        prompt.push_str(user);
-        prompt.push_str("<|eot_id|>");
-        prompt.push_str("<|start_header_id|>assistant<|end_header_id|>\n");
-        prompt.push_str(assistant);
-        prompt.push_str("<|eot_id|>");
-    }
-
-    // Current user turn — no closing eot_id so the model generates the response
-    prompt.push_str("<|start_header_id|>user<|end_header_id|>\n");
-    prompt.push_str(user_input);
-    prompt.push_str("<|eot_id|>");
-    prompt.push_str("<|start_header_id|>assistant<|end_header_id|>\n");
-
-    prompt
 }

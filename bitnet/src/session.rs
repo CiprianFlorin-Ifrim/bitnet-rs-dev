@@ -11,13 +11,9 @@ use crate::params::{ContextParams, GenerateParams, SamplingStrategy};
 
 struct SessionInner {
     ctx: NonNull<sys::llama_context>,
-    // Holds a reference to the model so the llama_model pointer remains valid
-    // for the lifetime of this context.
     _model: Arc<ModelInner>,
 }
 
-// llama_context must not be aliased across threads, but it is safe to move
-// to another thread. Our ownership model ensures no aliasing is possible.
 unsafe impl Send for SessionInner {}
 
 impl Drop for SessionInner {
@@ -28,16 +24,31 @@ impl Drop for SessionInner {
 
 /// An inference context tied to a loaded model.
 ///
-/// Each session wraps a single llama_context with its own KV cache. Sessions
-/// are not Clone. To run inference concurrently, create one session per thread
-/// from the same Model.
+/// Tracks KV cache position across calls, allowing incremental encoding for
+/// multi-turn conversations without re-encoding history on every turn.
 ///
-/// The KV cache is cleared at the start of each generate call, so calls are
-/// independent by default. For multi-turn conversations, accumulate the full
-/// conversation history in your application and pass it as the prompt on each
-/// turn.
+/// # Single-turn usage
 ///
-/// # Example
+/// ```no_run
+/// use bitnet::{Model, ModelParams, ContextParams, GenerateParams};
+///
+/// let model = Model::load("model.gguf", ModelParams::default())?;
+/// let mut session = model.session(ContextParams::default())?;
+/// let response = session.generate("Hello!", &GenerateParams::default())?;
+/// println!("{response}");
+/// # Ok::<(), bitnet::Error>(())
+/// ```
+///
+/// # Multi-turn usage
+///
+/// Sessions track the KV cache position across turns. Only new tokens are
+/// encoded on each turn — history is never re-encoded. You must call
+/// `encode("<|eot_id|>")` after each assistant turn to close it correctly,
+/// and call `reset()` between separate conversations.
+///
+/// BOS is added automatically on the first call when `kv_pos == 0`. Do not
+/// call `encode` before `generate_streaming` on a fresh session or BOS will
+/// be skipped.
 ///
 /// ```no_run
 /// use bitnet::{Model, ModelParams, ContextParams, GenerateParams};
@@ -45,12 +56,36 @@ impl Drop for SessionInner {
 /// let model = Model::load("model.gguf", ModelParams::default())?;
 /// let mut session = model.session(ContextParams::default())?;
 ///
-/// let response = session.generate("Hello!", &GenerateParams::default())?;
-/// println!("{response}");
+/// // Turn 1 — BOS added automatically because kv_pos is 0
+/// session.generate_streaming(
+///     "<|start_header_id|>system<|end_header_id|>\nYou are helpful.<|eot_id|>\
+///      <|start_header_id|>user<|end_header_id|>\nHello!<|eot_id|>\
+///      <|start_header_id|>assistant<|end_header_id|>\n",
+///     &GenerateParams::default(),
+///     |piece| print!("{piece}"),
+/// )?;
+/// session.encode("<|eot_id|>")?;
+///
+/// // Turn 2 — only new tokens encoded, history stays in KV cache
+/// session.generate_streaming(
+///     "<|start_header_id|>user<|end_header_id|>\nHow are you?<|eot_id|>\
+///      <|start_header_id|>assistant<|end_header_id|>\n",
+///     &GenerateParams::default(),
+///     |piece| print!("{piece}"),
+/// )?;
+/// session.encode("<|eot_id|>")?;
+///
+/// // Start a fresh conversation on the same session
+/// session.reset();
 /// # Ok::<(), bitnet::Error>(())
 /// ```
 pub struct Session {
     inner: SessionInner,
+    /// Current end position of the KV cache. Incremented after every token
+    /// fed to the model, whether during prefill, encode, or generation.
+    kv_pos: usize,
+    /// Maximum context size in tokens, cached from the context at creation.
+    n_ctx: usize,
 }
 
 impl Session {
@@ -60,6 +95,10 @@ impl Session {
         let mut c_params = unsafe { sys::llama_context_default_params() };
         c_params.n_ctx = params.n_ctx;
         c_params.n_batch = params.n_batch;
+        // n_ubatch must equal n_batch so the library never splits our batches
+        // internally. Internal splitting of multi-token batches through the
+        // BitNet lookup-table kernel produces corrupted output.
+        c_params.n_ubatch = params.n_batch;
         c_params.n_threads = threads;
         c_params.n_threads_batch = threads;
 
@@ -71,15 +110,81 @@ impl Session {
             Error::ContextCreate("llama_new_context_with_model returned null".into())
         })?;
 
+        let n_ctx = unsafe { sys::llama_n_ctx(ctx.as_ptr()) } as usize;
+
         Ok(Self {
             inner: SessionInner { ctx, _model: model },
+            kv_pos: 0,
+            n_ctx,
         })
+    }
+
+    /// Clears the KV cache and resets the position counter.
+    ///
+    /// Call this between separate conversations to reuse the session without
+    /// paying the cost of creating a new context.
+    pub fn reset(&mut self) {
+        unsafe { sys::llama_kv_cache_clear(self.inner.ctx.as_ptr()) };
+        self.kv_pos = 0;
+    }
+
+    /// Returns the current KV cache position in tokens.
+    pub fn kv_pos(&self) -> usize {
+        self.kv_pos
+    }
+
+    /// Returns the total context window size in tokens.
+    pub fn n_ctx(&self) -> usize {
+        self.n_ctx
+    }
+
+    /// Returns the number of tokens remaining before the context window is full.
+    pub fn tokens_remaining(&self) -> usize {
+        self.n_ctx.saturating_sub(self.kv_pos)
+    }
+
+    /// Encodes text into the KV cache without generating any output.
+    ///
+    /// Used to feed tokens that should not trigger generation — typically the
+    /// closing `<|eot_id|>` after each assistant turn in a multi-turn
+    /// conversation. Does not add a BOS token.
+    ///
+    /// Do not call this before the first `generate_streaming` call on a fresh
+    /// session — doing so will prevent BOS from being added.
+    pub fn encode(&mut self, text: &str) -> Result<(), Error> {
+        let ctx = self.inner.ctx.as_ptr();
+        let model = self.inner._model.ptr.as_ptr();
+
+        if self.kv_pos + 1 >= self.n_ctx {
+            return Err(Error::KvCacheFull);
+        }
+
+        let tokens = tokenise(model, text, false)?;
+        if tokens.is_empty() {
+            return Ok(());
+        }
+
+        for (i, &tok) in tokens.iter().enumerate() {
+            let mut single = [tok];
+            let pos = (self.kv_pos + i) as i32;
+            let batch = unsafe {
+                sys::llama_batch_get_one(single.as_mut_ptr(), 1, pos, 0)
+            };
+            match unsafe { sys::llama_decode(ctx, batch) } {
+                0 => {}
+                1 => return Err(Error::KvCacheFull),
+                n => return Err(Error::Decode(n)),
+            }
+        }
+        self.kv_pos += tokens.len();
+        Ok(())
     }
 
     /// Runs inference on the prompt and returns the complete generated text.
     ///
-    /// This is a convenience wrapper around generate_streaming that collects
-    /// all token pieces into a single String before returning.
+    /// Note: for multi-turn usage, prefer `generate_streaming` and call
+    /// `encode("<|eot_id|>")` afterward to properly close the assistant turn
+    /// in the KV cache.
     pub fn generate(&mut self, prompt: &str, params: &GenerateParams) -> Result<String, Error> {
         let mut output = String::new();
         self.generate_streaming(prompt, params, |piece| output.push_str(piece))?;
@@ -89,13 +194,14 @@ impl Session {
     /// Runs inference on the prompt, invoking the callback for each decoded
     /// token piece as it is produced.
     ///
-    /// The callback receives a string slice which may be a single character,
-    /// a partial word, or a full word depending on the tokeniser. It is called
-    /// synchronously on the calling thread, so it can write to stdout, push to
-    /// a channel, or accumulate into a buffer without additional synchronisation.
+    /// BOS is added automatically when `kv_pos == 0`. Subsequent calls do not
+    /// add BOS, allowing incremental encoding of conversation turns.
     ///
     /// Generation stops when the model emits an end-of-sequence token or when
-    /// max_tokens tokens have been produced.
+    /// `max_tokens` tokens have been produced.
+    ///
+    /// After this returns, call `encode("<|eot_id|>")` to close the assistant
+    /// turn before the next user message.
     pub fn generate_streaming(
         &mut self,
         prompt: &str,
@@ -105,28 +211,40 @@ impl Session {
         let ctx = self.inner.ctx.as_ptr();
         let model = self.inner._model.ptr.as_ptr();
 
-        unsafe { sys::llama_kv_cache_clear(ctx) };
+        // Add BOS only at the very start of a fresh conversation.
+        let add_bos = self.kv_pos == 0;
+        let tokens = tokenise(model, prompt, add_bos)?;
 
-        let tokens = tokenise(model, prompt, true)?;
-
-        let n_ctx = unsafe { sys::llama_n_ctx(ctx) } as usize;
-        if tokens.len() >= n_ctx {
+        // Warn when approaching the context limit.
+        let tokens_needed = tokens.len() + params.max_tokens;
+        if self.kv_pos + tokens_needed >= self.n_ctx {
             return Err(Error::Tokenise(format!(
-                "prompt is {} tokens but context window is {n_ctx}",
-                tokens.len()
+                "context window full: {} used + {} needed >= {} max. Call reset() to start a new conversation.",
+                self.kv_pos, tokens_needed, self.n_ctx
             )));
+        }
+
+        // Warn when over 80% full so callers can act before hitting the limit.
+        if self.kv_pos as f32 / self.n_ctx as f32 > 0.8 {
+            eprintln!(
+                "warning: context window {:.0}% full ({}/{} tokens used)",
+                100.0 * self.kv_pos as f32 / self.n_ctx as f32,
+                self.kv_pos,
+                self.n_ctx
+            );
         }
 
         let sampler = build_sampler(&params.sampling)?;
 
-        // Feed each prompt token individually. The BitNet ARM TL1 and x86 TL2
-        // lookup-table kernels only produce valid logits for single-token
-        // batches. Batching multiple tokens causes NaN output regardless of
-        // the n_batch setting. This matches the -b 1 flag used by run_inference.py.
+        // Feed each prompt token individually at the correct KV cache position.
+        // The BitNet lookup-table kernel only produces valid results with
+        // single-token batches. The incremental KV cache means only NEW tokens
+        // are processed each turn so this is fast regardless.
         for (i, &tok) in tokens.iter().enumerate() {
             let mut single = [tok];
+            let pos = (self.kv_pos + i) as i32;
             let batch = unsafe {
-                sys::llama_batch_get_one(single.as_mut_ptr(), 1, i as i32, 0)
+                sys::llama_batch_get_one(single.as_mut_ptr(), 1, pos, 0)
             };
             match unsafe { sys::llama_decode(ctx, batch) } {
                 0 => {}
@@ -140,23 +258,17 @@ impl Session {
                 }
             }
         }
+        self.kv_pos += tokens.len();
 
-        let mut n_generated = 0usize;
-        // Reuse a single-element array for every autoregressive step to avoid
-        // repeated stack allocation in the hot loop.
         let mut next_token = [0i32; 1];
+        let mut n_generated = 0usize;
 
         loop {
             if n_generated >= params.max_tokens {
                 break;
             }
 
-            // Logits are always at output row 0 since every decode processes
-            // exactly one token.
             let token = unsafe { sys::llama_sampler_sample(sampler, ctx, 0) };
-
-            // Inform the sampler so stateful stages such as repetition penalty
-            // track the accepted token correctly.
             unsafe { sys::llama_sampler_accept(sampler, token) };
 
             if unsafe { sys::llama_token_is_eog(model, token) } {
@@ -167,11 +279,9 @@ impl Session {
             on_token(&piece);
             n_generated += 1;
 
-            // Feed the new token back at the next position in the sequence.
             next_token[0] = token;
-            let pos = (tokens.len() + n_generated - 1) as i32;
             let batch = unsafe {
-                sys::llama_batch_get_one(next_token.as_mut_ptr(), 1, pos, 0)
+                sys::llama_batch_get_one(next_token.as_mut_ptr(), 1, self.kv_pos as i32, 0)
             };
             match unsafe { sys::llama_decode(ctx, batch) } {
                 0 => {}
@@ -184,10 +294,10 @@ impl Session {
                     return Err(Error::Decode(n));
                 }
             }
+            self.kv_pos += 1;
         }
 
         unsafe { sys::llama_sampler_free(sampler) };
-
         Ok(())
     }
 }
@@ -200,9 +310,6 @@ fn tokenise(
     let c_text = CString::new(text)
         .map_err(|_| Error::Tokenise("prompt contains a null byte".into()))?;
 
-    // A negative return value indicates the buffer was too small and its
-    // absolute value is the required capacity. We use this to allocate exactly
-    // the right buffer on the second call instead of over-allocating.
     let n_required = unsafe {
         sys::llama_tokenize(
             model,
@@ -248,8 +355,6 @@ fn token_to_text(
     model: *const sys::llama_model,
     token: sys::llama_token,
 ) -> Result<String, Error> {
-    // Start with a 32-byte buffer which covers the vast majority of tokens
-    // without needing a retry.
     let mut buf = vec![0u8; 32];
     loop {
         let n = unsafe {
@@ -263,7 +368,6 @@ fn token_to_text(
             )
         };
         if n < 0 {
-            // Buffer was too small. The absolute value is the required size.
             buf.resize((-n) as usize, 0);
         } else {
             buf.truncate(n as usize);
@@ -288,14 +392,11 @@ fn build_sampler(strategy: &SamplingStrategy) -> Result<*mut sys::llama_sampler,
             unsafe { sys::llama_sampler_chain_add(chain, stage) };
         }
         SamplingStrategy::TopP { temperature, top_p, seed } => {
-            // Repetition penalty prevents the model from looping on the same
-            // token or phrase, which is common without it on completion prompts.
             let penalty_stage = unsafe {
                 sys::llama_sampler_init_penalties(64, 1.1, 0.0, 0.0)
             };
             unsafe { sys::llama_sampler_chain_add(chain, penalty_stage) };
-            // Sampler stage order matches the chain used by run_inference.py:
-            // top-k -> top-p -> min-p -> temperature -> distribution draw.
+
             let top_k_stage = unsafe { sys::llama_sampler_init_top_k(40) };
             unsafe { sys::llama_sampler_chain_add(chain, top_k_stage) };
 
@@ -310,8 +411,6 @@ fn build_sampler(strategy: &SamplingStrategy) -> Result<*mut sys::llama_sampler,
             let temp_stage = unsafe { sys::llama_sampler_init_temp(*temperature) };
             unsafe { sys::llama_sampler_chain_add(chain, temp_stage) };
 
-            // Derive a seed from the system clock when the caller has not
-            // specified one, so repeated calls produce different outputs.
             let effective_seed = if *seed == u32::MAX {
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
