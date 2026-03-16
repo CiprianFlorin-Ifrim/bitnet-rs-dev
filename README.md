@@ -68,7 +68,7 @@ hf download microsoft/BitNet-b1.58-2B-4T-gguf \
 
 The model file is `models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf`.
 
-### Option 2 — Convert from BF16 weights (recommended for macOS)
+### Option 2 — Convert from BF16 weights (a must for ARM systems)
 ```sh
 pip install huggingface_hub numpy torch
 
@@ -96,6 +96,22 @@ cargo build --release
 ```sh
 cargo build --release
 ```
+
+---
+
+## Performance
+
+Benchmarked on [Hetzner Cloud](https://www.hetzner.com/cloud/) using the
+`BitNet-b1.58-2B-4T` model with `max_tokens = 512`, `TopP` sampling.
+
+| Instance | CPU | Arch | Kernel | TTFT | Short tok/s | Long tok/s |
+|----------|-----|------|--------|------|-------------|------------|
+| CX23 | 2 vCPU Intel/AMD | x86-64 (AVX-512) | TL2 | ~2.5s | 2.3–2.5 | 7.4 |
+| CAX11 | 2 vCPU Ampere | ARM64 | TL1 | ~2.6s | 2.4 | 7.5 |
+
+TTFT includes prompt prefill. Short tok/s is averaged over responses under 30
+tokens where prefill overhead dominates; long tok/s is averaged over responses
+of 100+ tokens where generation dominates.
 
 ---
 
@@ -238,3 +254,6 @@ git submodule update --remote bitnet-llm-sys/bitnet.cpp
 git add bitnet-llm-sys/bitnet.cpp
 git commit -m "Update bitnet.cpp submodule"
 ```
+
+**Generation.** The pre-packaged GGUF (`Option 1`) produces word-salad output on ARM.
+Use `Option 2` (convert from BF16) on ARM Linux.
