@@ -1,23 +1,20 @@
-# bitnet-rs
+# bitnet-llm-rs-dev
 
-Safe Rust bindings to Microsoft's [BitNet b1.58](https://github.com/microsoft/BitNet)
-inference engine (`bitnet.cpp`).
+Development repository for [bitnet-llm](https://crates.io/crates/bitnet-llm) — safe Rust bindings to Microsoft's [BitNet b1.58](https://github.com/microsoft/BitNet) inference engine (`bitnet.cpp`).
 
-The crate provides a clean, ergonomic API with both full-response and
-streaming-callback inference, targeting macOS (Apple Silicon) and Linux
-(x86-64).
+This repo uses a git submodule for bitnet.cpp, making it easy to track upstream changes. For production use, add `bitnet-llm` directly from crates.io instead.
 
 ---
 
 ## Workspace layout
 ```
-bitnet-rs/
-├── Cargo.toml           workspace root
-├── bitnet-sys/          raw FFI + CMake build of bitnet.cpp
+bitnet-llm-rs-dev/
+├── Cargo.toml                workspace root
+├── bitnet-llm-sys/           raw FFI + CMake build of bitnet.cpp
 │   ├── build.rs
-│   ├── bitnet.cpp/      git submodule (see step 1 below)
+│   ├── bitnet.cpp/           git submodule
 │   └── src/lib.rs
-└── bitnet/              safe, ergonomic Rust API
+└── bitnet-llm/               safe, ergonomic Rust API
     └── src/
         ├── lib.rs
         ├── error.rs
@@ -42,55 +39,45 @@ bitnet-rs/
 
 ---
 
-## Step 1 — Add the bitnet.cpp submodule
-
-The bitnet.cpp C++ source tree must live at `bitnet-sys/bitnet.cpp`.
+## Step 1 — Clone with submodule
 ```sh
-git submodule add https://github.com/microsoft/BitNet bitnet-sys/bitnet.cpp
+git clone --recurse-submodules https://github.com/CiprianFlorin-Ifrim/bitnet-llm-rs-dev
+```
+
+Or if already cloned:
+```sh
 git submodule update --init --recursive
 ```
 
-> If you cloned this repo without `--recurse-submodules`, run
-> `git submodule update --init --recursive` from the repository root.
-
 Two generated header files are required that are not committed to the BitNet
-repository. They are produced by running `setup_env.py` in an existing BitNet
-installation and must be copied into the submodule before building:
+repository. Copy them from an existing BitNet installation:
 ```sh
-# Copy the generated headers from your BitNet installation
-cp /path/to/BitNet/include/bitnet-lut-kernels.h bitnet-sys/bitnet.cpp/include/
-cp /path/to/BitNet/include/ggml-bitnet.h        bitnet-sys/bitnet.cpp/3rdparty/llama.cpp/ggml/include/
-```
-
-If you do not have an existing BitNet installation, run `setup_env.py` from the
-submodule itself first to generate them:
-```sh
-cd bitnet-sys/bitnet.cpp
-pip install -r requirements.txt
-python setup_env.py -md /tmp/placeholder -q i2_s || true
-cd ../..
+cp /path/to/BitNet/include/bitnet-lut-kernels.h bitnet-llm-sys/bitnet.cpp/include/
+cp /path/to/BitNet/include/ggml-bitnet.h        bitnet-llm-sys/bitnet.cpp/3rdparty/llama.cpp/ggml/include/
 ```
 
 ---
 
-## Step 2 - Download and convert the model
+## Step 2 — Download the model
 
-The pre-packaged GGUF on Hugging Face is missing pre-tokenizer metadata and
-produces incoherent output. You must convert from the BF16 master weights.
+### Option 1 — Pre-packaged GGUF (simplest)
 ```sh
-# Create a conda environment (recommended)
-conda create -n bitnet python=3.11
-conda activate bitnet
+hf download microsoft/BitNet-b1.58-2B-4T-gguf \
+    --local-dir models/BitNet-b1.58-2B-4T
+```
 
-# Install conversion dependencies
-pip install -r bitnet-sys/bitnet.cpp/requirements.txt
+The model file is `models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf`.
 
-# Download the BF16 master weights (~5 GB)
+### Option 2 — Convert from BF16 weights (recommended for macOS)
+```sh
+pip install huggingface_hub numpy torch
+
 hf download microsoft/bitnet-b1.58-2B-4T-bf16 \
     --local-dir models/bitnet-b1.58-2B-4T-bf16
 
-# Convert to GGUF format
-python bitnet-sys/bitnet.cpp/utils/convert-helper-bitnet.py \
+pip install -r bitnet-llm-sys/bitnet.cpp/requirements.txt
+
+python3 bitnet-llm-sys/bitnet.cpp/utils/convert-helper-bitnet.py \
     models/bitnet-b1.58-2B-4T-bf16
 ```
 
@@ -110,67 +97,72 @@ cargo build --release
 cargo build --release
 ```
 
-The build script auto-detects AVX-512 and enables the `TL2` BitNet kernel if
-available, falling back to the AVX2 `TL1` kernel automatically.
-
 ---
 
 ## Usage
 
-### Interactive chat
+### Running the examples
 ```sh
-cargo run --release --example inference -- \
-    models/bitnet-b1.58-2B-4T-bf16/ggml-model-i2s-bitnet.gguf \
+# Single prompt streaming inference
+cargo run --release --example inference_streaming -- \
+    models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf \
+    "What is the capital of France?"
+
+# Single prompt, returns full response at once
+cargo run --release --example inference_standard -- \
+    models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf \
+    "What is the capital of France?"
+
+# Interactive multi-turn chat
+cargo run --release --example chat -- \
+    models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf \
     "You are a helpful assistant."
 ```
 
 ### Library usage
 ```rust
-use bitnet::{
+use bitnet_llm::{
     init, suppress_warnings, ContextParams, GenerateParams,
     Model, ModelParams, SamplingStrategy,
 };
 use std::io::Write;
 
-fn main() -> Result<(), bitnet::Error> {
+fn main() -> Result<(), bitnet_llm::Error> {
     init();
     suppress_warnings();
 
     let model = Model::load(
-        "models/bitnet-b1.58-2B-4T-bf16/ggml-model-i2s-bitnet.gguf",
+        "models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf",
         ModelParams::default(),
     )?;
 
     let mut session = model.session(ContextParams::default())?;
+    let params = GenerateParams::default();
 
-    // Build a prompt using the Llama 3 chat template
-    let prompt = "<|start_header_id|>user<|end_header_id|>\n\
-                  What is the capital of France?<|eot_id|>\
-                  <|start_header_id|>assistant<|end_header_id|>\n";
+    // Turn 1
+    session.generate_streaming(
+        "<|start_header_id|>system<|end_header_id|>\n\
+         You are a helpful assistant.<|eot_id|>\
+         <|start_header_id|>user<|end_header_id|>\n\
+         Hello!<|eot_id|>\
+         <|start_header_id|>assistant<|end_header_id|>\n",
+        &params,
+        |piece| { print!("{piece}"); let _ = std::io::stdout().flush(); },
+    )?;
+    session.encode("<|eot_id|>")?;
 
-    // Full response at once
-    let response = session.generate(prompt, &GenerateParams::default())?;
-    println!("{response}");
+    // Turn 2 — only new tokens encoded, history stays in KV cache
+    session.generate_streaming(
+        "<|start_header_id|>user<|end_header_id|>\n\
+         How are you?<|eot_id|>\
+         <|start_header_id|>assistant<|end_header_id|>\n",
+        &params,
+        |piece| { print!("{piece}"); let _ = std::io::stdout().flush(); },
+    )?;
+    session.encode("<|eot_id|>")?;
 
-    // Streaming — callback fires for each token piece as it is produced
-    session.generate_streaming(prompt, &GenerateParams::default(), |piece| {
-        print!("{piece}");
-        let _ = std::io::stdout().flush();
-    })?;
-
-    // Custom sampling
-    let params = GenerateParams {
-        max_tokens: 256,
-        sampling: SamplingStrategy::TopP {
-            temperature: 0.8,
-            top_p: 0.95,
-            seed: 42,
-        },
-    };
-    let response = session.generate(prompt, &params)?;
-    println!("{response}");
-
-    bitnet::deinit();
+    session.reset();
+    bitnet_llm::deinit();
     Ok(())
 }
 ```
@@ -188,6 +180,10 @@ fn main() -> Result<(), bitnet::Error> {
 | `model.session(ContextParams)` | Create an inference context. |
 | `session.generate(prompt, &params)` | Run inference, return `String`. |
 | `session.generate_streaming(prompt, &params, callback)` | Run inference, call callback per token piece. |
+| `session.encode(text)` | Feed text into the KV cache without generating output. |
+| `session.reset()` | Clear the KV cache and start a fresh conversation. |
+| `session.kv_pos()` | Current token position in the KV cache. |
+| `session.tokens_remaining()` | Tokens remaining before context window is full. |
 
 ### `ModelParams`
 
@@ -217,20 +213,28 @@ fn main() -> Result<(), bitnet::Error> {
 ## Important notes
 
 **CPU only.** BitNet's ternary lookup-table kernels only run on the CPU. The
-ARM TL1 kernel is used on Apple Silicon and the x86 TL2 kernel on Linux. GPU is
-not supported.
+ARM TL1 kernel is used on Apple Silicon and the x86 TL2 kernel on Linux. GPU
+offloading is not supported.
 
-**Single-token decode loop.** The BitNet kernels produce valid output only when
-decoding one token at a time. This library handles this correctly internally.
-Feeding multi-token batches to `llama_decode` directly will produce garbage.
+**Single-token processing.** The BitNet kernels produce valid output only when
+processing one token at a time. This library handles this correctly internally.
 
 **Chat template.** This model uses the Llama 3 chat template with
 `<|start_header_id|>`, `<|end_header_id|>`, and `<|eot_id|>` control tokens.
-See the inference example for a complete multi-turn chat implementation.
 
-**Build time.** The first build compiles bitnet.cpp from source via CMake,
-which takes a few minutes. Subsequent builds use the cached output.
+**Context window.** The model has a 4096 token context window. The library
+warns at 80% usage and returns an error when full. Call `session.reset()` to
+start a fresh conversation.
 
-**Multi-turn chat.** Each `generate` call clears the KV cache. For
-conversations, accumulate the full history in your application and pass it as
-the prompt on each turn. The inference example demonstrates this pattern.
+**Multi-turn correctness.** Always call `session.encode("<|eot_id|>")` after
+each assistant turn. Always call `session.reset()` between separate
+conversations. Do not call `session.encode()` before the first
+`generate_streaming` call on a fresh session as this will prevent BOS from
+being added.
+
+**Updating bitnet.cpp.** To pull in upstream BitNet changes, run:
+```sh
+git submodule update --remote bitnet-llm-sys/bitnet.cpp
+git add bitnet-llm-sys/bitnet.cpp
+git commit -m "Update bitnet.cpp submodule"
+```

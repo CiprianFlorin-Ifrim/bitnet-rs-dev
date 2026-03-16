@@ -1,13 +1,13 @@
 [package]
-name = "bitnet"
-version = "0.1.0"
+name = "bitnet-llm"
+version = "1.0.2"
 edition = "2021"
 description = "Safe Rust bindings to Microsoft's BitNet b1.58 inference engine."
 license = "MIT"
-repository = "https://github.com/ciprianefrim/bitnet-rs"
+repository = "https://github.com/CiprianFlorin-Ifrim/bitnet-llm-rs-dev"
 keywords = ["bitnet", "llm", "inference", "machine-learning", "ai"]
 categories = ["science", "api-bindings"]
-readme = "README.md"
+readme = "../README.md"
 
 [dependencies]
-bitnet-sys = { path = "../bitnet-sys" }
+bitnet-llm-sys = { path = "../bitnet-llm-sys", version = "1.0.1" }

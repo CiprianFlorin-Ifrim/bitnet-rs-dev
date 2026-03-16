@@ -3,15 +3,15 @@
 version = 4
 
 [[package]]
-name = "bitnet"
-version = "0.1.0"
+name = "bitnet-llm"
+version = "1.0.2"
 dependencies = [
- "bitnet-sys",
+ "bitnet-llm-sys",
 ]
 
 [[package]]
-name = "bitnet-sys"
-version = "0.1.0"
+name = "bitnet-llm-sys"
+version = "1.0.1"
 dependencies = [
  "cmake",
 ]
