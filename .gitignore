@@ -21,4 +21,5 @@ target
 #.idea/
 
 # MacOS files
-.DS_Store
+.DS_Storebitnet-llm-sys/bitnet.cpp/include/bitnet-lut-kernels.h
+bitnet-llm-sys/bitnet.cpp/3rdparty/llama.cpp/ggml/include/ggml-bitnet.h
